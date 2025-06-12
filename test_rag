@@ -1,0 +1,409 @@
+import os
+from datetime import datetime
+import json
+from langchain_community.llms import Ollama
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import Chroma
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.document_loaders import TextLoader
+from langchain.prompts import PromptTemplate
+from farsi_text_splitter import FarsiTextSplitter
+
+# Define Farsi prompt templates
+CONDENSE_QUESTION_TEMPLATE = """
+با توجه به گفتگوی قبلی (اگر وجود دارد) و سوال جدید، یک سوال مستقل و کامل به فارسی بسازید.
+
+گفتگوی قبلی: {chat_history}
+سوال جدید: {question}
+
+سوال مستقل:"""
+
+QA_TEMPLATE = """شما یک دستیار هوشمند فارسی زبان هستید. لطفا به سوال کاربر با استفاده از اطلاعات داده شده پاسخ دهید.
+پاسخ باید:
+1. به زبان فارسی باشد
+2. دقیق و مرتبط با سوال باشد
+3. فقط بر اساس اطلاعات داده شده باشد
+4. اگر پاسخ در متن نیست، صادقانه بگویید که نمی‌دانید
+
+متن: {context}
+سوال: {question}
+
+پاسخ فارسی:"""
+
+# QA_TEMPLATE = """شما یک دستیار هوشمند فارسی زبان هستید. لطفا به سوال کاربر با استفاده از اطلاعات داده شده پاسخ دهید.
+# پاسخ باید:
+# 1. به زبان فارسی باشد
+# 2. دقیق و مرتبط با سوال باشد
+# 3. فقط بر اساس اطلاعات داده شده باشد
+# 4. اگر پاسخ در متن نیست، صادقانه بگویید که نمی‌دانید
+# 5. اگر اطلاعات داده شده دارای تناقض یا تعارض است، همه تعارض‌ها را به‌طور شفاف ذکر کنید و توضیح دهید که چرا تناقض وجود دارد
+
+# متن: {context}
+# سوال: {question}
+
+# پاسخ فارسی:"""
+
+class Logger:
+    def __init__(self):
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_dir = "logs"
+        self.ensure_log_dir()
+        
+    def ensure_log_dir(self):
+        """Ensure log directory exists"""
+        if not os.path.exists(self.log_dir):
+            os.makedirs(self.log_dir)
+            
+    def log(self, message: str):
+        """Log a message to console and file"""
+        print(message)
+        with open(os.path.join(self.log_dir, "log.txt"), "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+            
+    def save_qa(self, question: str, response: dict):
+        """Save Q&A results to a dedicated file"""
+        with open(os.path.join(self.log_dir, "qa_results_qwen.txt"), "a", encoding="utf-8") as f:
+            f.write(f"\n=== {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            f.write(f"Question: {question}\n")
+            if "error" in response:
+                f.write(f"Error: {response['error']}\n")
+            else:
+                f.write(f"Answer: {response['answer']}\n")
+                if response.get('source_documents'):
+                    f.write("Sources:\n")
+                    for idx, doc in enumerate(response['source_documents'], 1):
+                        if hasattr(doc, 'page_content'):
+                            f.write(f"- Source {idx}: {doc.page_content[:200]}...\n")
+            f.write("="*50 + "\n")
+
+class LocalFarsiRAG:
+    def __init__(self, logger):
+        self.logger = logger
+        self.persist_dir = "chroma_db"
+        
+        # Initialize Ollama with lower temperature
+        self.llm = Ollama(
+            model="Qwen3:4b", #mshojaei77/gemma3persian", #"mistral",
+            temperature=0.3
+        )
+        
+        # Use multilingual embeddings
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="Qwen/Qwen3-Embedding-4B", #"HooshvareLab/bert-fa-zwnj-base", #"sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+            model_kwargs={'device': 'cpu'}
+        )
+        
+        # Enhanced Farsi prompt template
+        self.prompt_template = PromptTemplate(
+            input_variables=["context", "question"],
+            template="""شما یک دستیار هوشمند هستید که به زبان فارسی پاسخ می‌دهد.
+            لطفاً با استفاده از متن زیر به سؤال پاسخ دهید. اگر پاسخ سؤال در متن نیست، صراحتاً بگویید "من نمی‌توانم این سؤال را با اطمینان پاسخ دهم."
+            هرگز اطلاعات نادرست یا حدسی ارائه ندهید.
+            .اگر اطلاعات داده شده دارای تناقض یا تعارض است، همه تعارض‌ها را به‌طور شفاف ذکر کنید و توضیح دهید که چرا تناقض وجود دارد
+
+
+            متن مرجع:
+            {context}
+
+            سؤال:
+            {question}
+
+            پاسخ (فقط بر اساس متن مرجع و با ذکر منبع):"""
+        )
+        
+        # Update memory configuration with output_key
+        self.memory = ConversationBufferMemory(
+            memory_key="chat_history",
+            output_key="answer",
+            return_messages=True,
+            input_key="question"
+        )
+        
+        self.vectorstore = None
+        
+    def load_document(self, file_path: str):
+        """Load and process a document"""
+        try:
+            # Check if file exists
+            if not os.path.exists(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+            
+            # First try to read the file directly to check content
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                if not content.strip():
+                    raise ValueError("File is empty")
+                self.logger.log(f"File size: {len(content)} bytes")
+            
+            # Load document with explicit UTF-8 encoding
+            loader = TextLoader(
+                file_path,
+                encoding='utf-8',
+                autodetect_encoding=True
+            )
+            
+            documents = loader.load()
+            if not documents:
+                raise ValueError("No documents were loaded")
+            
+            self.logger.log(f"Successfully loaded document: {file_path}")
+            self.logger.log(f"Number of documents: {len(documents)}")
+            
+            # Log first few characters of the first document for debugging
+            if documents and hasattr(documents[0], 'page_content'):
+                self.logger.log(f"First 100 chars: {documents[0].page_content[:100]}")
+            
+            # Use the new FarsiTextSplitter for better Persian text handling
+            text_splitter = FarsiTextSplitter(
+                chunk_size=500,
+                chunk_overlap=50,
+                keep_separator=True
+            )
+            
+            texts = text_splitter.split_documents(documents)
+            self.logger.log(f"Document split into {len(texts)} chunks")
+            
+            # Log first chunk for debugging
+            if texts:
+                self.logger.log(f"First chunk sample: {texts[0].page_content[:100]}")
+            
+            # Create vector store
+            self.vectorstore = Chroma.from_documents(
+                documents=texts,
+                embedding=self.embeddings,
+                persist_directory=self.persist_dir
+            )
+            self.vectorstore.persist()
+            self.logger.log("Vector store created and persisted successfully")
+            
+        except FileNotFoundError as e:
+            self.logger.log(f"File not found error: {str(e)}")
+            raise
+        except UnicodeDecodeError as e:
+            self.logger.log(f"Encoding error: {str(e)}. Please ensure the file is properly encoded in UTF-8.")
+            raise
+        except ValueError as e:
+            self.logger.log(f"Value error: {str(e)}")
+            raise
+        except Exception as e:
+            self.logger.log(f"Error loading document: {str(e)}")
+            self.logger.log(f"Error type: {type(e)}")
+            raise
+            
+    def ask(self, question: str) -> dict:
+        """Process a question and return answer with sources"""
+        try:
+            if not self.vectorstore:
+                return {"error": "No documents loaded. Please load a document first."}
+                
+            # Create chain with corrected retriever configuration
+            chain = ConversationalRetrievalChain.from_llm(
+                llm=self.llm,
+                retriever=self.vectorstore.as_retriever(
+                    search_type="mmr",  # Use MMR for better diversity
+                    search_kwargs={
+                        "k": 8,  # Increased for better context
+                        "fetch_k": 20,  # Fetch more documents initially
+                        "lambda_mult": 0.7  # Balance between relevance and diversity
+                    }
+                ),
+                memory=self.memory,
+                combine_docs_chain_kwargs={
+                    "prompt": self.prompt_template,
+                    "document_separator": "\n\n---\n\n"  # Clear separation between sources
+                },
+                chain_type="stuff",  # Use stuff method for better context integration
+                return_source_documents=True,  # Always return sources
+                verbose=True,  # Enable verbose mode for debugging
+                return_generated_question=False  # Don't return the generated question
+            )
+            
+            # Get response
+            response = chain.invoke({"question": question})
+            
+            return {
+                "answer": response["answer"],
+                "source_documents": response.get("source_documents", [])
+            }
+            
+        except Exception as e:
+            self.logger.log(f"Error in ask method: {str(e)}")
+            self.logger.log(f"Error type: {type(e)}")
+            return {"error": f"Error processing question: {str(e)}"}
+
+def main():
+    # Create logger
+    logger = Logger()
+    
+    # Initialize the local RAG system
+    try:
+        rag = LocalFarsiRAG(logger=logger)
+    except Exception as e:
+        logger.log(f"Failed to initialize RAG system: {str(e)}")
+        return
+    
+    # Test questions
+    test_questions = [
+#         "نمایندگان مجلس خبرگان در تهران چند نفر است؟",
+#         "شرایط کاندیداهای مجلس خبرگان چیست؟",
+#         "آیا نمایندگان مجلس خبرگان باید ساکن حوزه انتخابیه خود باشند؟",
+#         "مدت دوره نمایندگی مجلس خبرگان چند سال است؟",
+#         "چه کسی بر انتخابات مجلس خبرگان نظارت می‌کند؟",
+#                 "چه کسی بر انتخابات مجلس خبرگان نظارت می‌کند؟",
+#         "طبق قانون، شرط سنی برای رأی‌دهندگان در انتخابات مجلس خبرگان چیست؟",
+# "بر اساس قانون، چه نهادی مسئول تشخیص صلاحیت داوطلبان نمایندگی مجلس خبرگان است؟",
+# "در صورت تساوی آراء در حوزه‌ای که فقط یک نفر باید انتخاب شود، انتخاب نهایی چگونه صورت می‌گیرد؟",
+# "مدت نمایندگی اعضای مجلس خبرگان چند سال است؟"
+        # "مدت دوره نمایندگی مجلس خبرگان چند سال است؟",
+        # "چه کسی بر انتخابات مجلس خبرگان نظارت می‌کند؟"
+
+"حداقل نمره قبولی در هر درس چند است؟",
+"در صورت مشروط شدن چند نیمسال متوالی در کارشناسی پیوسته، دانشجو از ادامه تحصیل محروم می‌شود؟",
+"در صورت حذف یک درس نظری با رعایت شرایط، تعداد واحدهای باقیمانده نباید کمتر از چه عددی شود؟",
+"حداکثر مدت مجاز تحصیل در دوره کارشناسی پیوسته طبق آیین‌نامه چند سال است؟",
+"چه رابطه‌ای میان میانگین کل و صدور مدرک تحصیلی در پایان دوره وجود دارد؟",
+"چرا دانشجویان نمی‌توانند همزمان از دو تبصره مربوط به انتخاب واحد بهره‌مند شوند؟",
+"حداکثر تعداد واحد مجاز قابل اخذ در دوره تابستان چقدر است؟",
+"در صورت عدم ثبت‌نام دانشجو در یک نیمسال تحصیلی، چه حکمی صادر می‌شود؟",
+"آیا تغییر رشته در دوره کارشناسی ناپیوسته مجاز است؟",
+"حداقل میانگین کل لازم برای دانش‌آموختگی در پایان دوره چند است؟",
+"مفهوم درس جبرانی چیست و در چه شرایطی ارائه می‌شود؟",
+"در چه شرایطی دانشجو می‌تواند واحد درسی را به‌صورت معرفی به استاد بگذراند؟",
+"چه تفاوتی بین آموزش حضوری، نیمه‌حضوری و غیرحضوری در این آیین‌نامه وجود دارد؟",
+"وظیفه راهنمای آموزشی دانشجو چیست؟",
+"چه زمانی نمره مردودی در معدل کل تأثیر ندارد؟ توضیح دهید",
+"چرا برای هر دانشجو فقط یک‌بار آموزش رایگان در یک رشته تحصیلی مجاز است؟",
+"تفاوت بین دوره کاردانی پیوسته و ناپیوسته از نظر ساختار آموزشی چیست؟",
+"چرا دانشجویی که سه ترم مشروط شود در کارشناسی پیوسته، از ادامه تحصیل محروم می‌گردد؟ تحلیل کنید.",
+"دانشجویی پس از ۴ سال هنوز فارغ‌التحصیل نشده است. در چه شرایطی دانشگاه می‌تواند به او اجازه ادامه تحصیل دهد؟",
+"دانشجویی می‌خواهد از رشته غیرمرتبط کارشناسی ناپیوسته پذیرش بگیرد. دانشگاه چه تصمیمی درباره واحدهای جبرانی او می‌گیرد؟",
+    "بیشترین امتیاز قابل کسب برای داوطلبان دکتری بدون آزمون از فعالیت‌های پژوهشی چقدر است؟",
+"حداکثر امتیاز قابل کسب از مقالات علمی-پژوهشی مرتبط با پایان‌نامه چند امتیاز است؟",
+"تفاوت امتیاز بین مقاله کنفرانسی داخلی و خارجی چیست؟",
+"حداکثر چند امتیاز برای تألیف یا ترجمه کتاب مرتبط با رشته تحصیلی در نظر گرفته می‌شود؟",
+"در صورتی که کیفیت پایان‌نامه کارشناسی ارشد «عالی» یا «بسیار خوب» باشد، چند امتیاز تعلق می‌گیرد؟",
+
+"هدف اصلی از تدوین آیین‌نامه آموزشی کارشناسی چیست؟",
+"آموزش رایگان برای چه کسانی امکان‌پذیر است؟",
+"دانشجو در هر نیمسال تحصیلی چه تعداد واحد مجاز به انتخاب است؟",
+"شرایط انتخاب بیش از ۲۰ واحد درسی در یک نیمسال چیست؟",
+"دانشجوی کارشناسی ناپیوسته چه تعداد واحد جبرانی ممکن است بگذراند؟",
+"تعریف دوره کارشناسی پیوسته چیست؟",
+"تفاوت دوره حضوری و غیرحضوری در چیست؟",
+"راهنمای آموزشی چه نقشی در مسیر تحصیلی دانشجو دارد؟",
+"حداقل نمره قبولی در هر درس چیست؟",
+"دانشجویی که میانگین نمراتش کمتر از ۱۲ شود چه وضعیتی دارد؟",
+"مدت مجاز تحصیل در دوره کارشناسی پیوسته چند سال است؟",
+"شرایط اخذ مرخصی تحصیلی چیست؟",
+"دانشجویی که قصد انصراف دارد، چه مراحلی باید طی کند؟",
+"تعریف تغییر رشته یا گرایش چیست؟",
+"آیا تغییر رشته از غیرحضوری به حضوری مجاز است؟",
+"شرایط پذیرش دانشجو برای میهمانی و انتقال چیست؟",
+"چه زمانی دانشجو دانش‌آموخته محسوب می‌شود؟",
+"ارزیابی پیشرفت تحصیلی دانشجو چگونه انجام می‌شود؟",
+"وظایف استاد راهنما در دوره دکتری چیست؟",
+"چه زمانی استاد مشاور در دوره دکتری تعیین می‌شود؟",
+"مراحل آموزشی دوره دکتری شامل چه بخش‌هایی است؟",
+"مدت مجاز مرحله آموزشی در دکتری چند نیمسال است؟",
+"ارزیابی جامع شامل چه بخش‌هایی است؟",
+"شرط موفقیت در ارزیابی جامع چیست؟",
+"چه نمره‌ای برای آزمون زبان خارجی در دکتری مورد نیاز است؟",
+"چه زمانی دانشجو وارد مرحله پژوهشی می‌شود؟",
+"برای دفاع از رساله چه شرایطی لازم است؟",
+"ترکیب هیئت داوران دفاع از رساله چگونه است؟",
+"نمرات رساله به چه صورت دسته‌بندی می‌شوند؟",
+"مدت مجاز کل تحصیل در دکتری چند سال است؟",
+"شرایط استفاده از مرخصی تحصیلی در دکتری چیست؟",
+"چه عواملی باعث محرومیت از ادامه تحصیل در دکتری می‌شوند؟",
+"دانشجوی دکتری چه زمانی دانش‌آموخته محسوب می‌شود؟",
+"چه مواردی باید در تدوین و ارسال رساله رعایت شود؟",
+"زبان نگارش رساله دکتری به چه صورت است؟",
+"نقش شورای تحصیلات تکمیلی دانشگاه در فرایندهای دکتری چیست؟",
+"آیا دانشجویان شعب خارجی می‌توانند به زبان انگلیسی رساله بنویسند؟",
+"اگر رساله غیرقابل قبول ارزیابی شود، چه اتفاقی می‌افتد؟",
+"حداقل نمره قبولی هر درس در دکتری چقدر است؟",
+"در صورتی که میانگین کل دانشجو کمتر از ۱۶ باشد چه می‌شود؟",
+"استاد راهنمای دوم در چه شرایطی تعیین می‌شود؟",
+"دانشجو تا چه زمانی باید موضوع رساله را تعیین کند؟",
+"شرط ثبت‌نام دانشجو در هر نیمسال چیست؟",
+"چه تعداد مقاله علمی باید از رساله استخراج شود؟",
+"شرایط دفاع مجدد از رساله چگونه است؟",
+"ترکیب هیئت داوران شامل چه افرادی است؟",
+"سهم هر داور در رأی‌گیری چگونه است؟",
+"شرط کفایت دستاوردهای علمی برای دفاع چیست؟",
+"چه شرایطی برای دانشجویان انصرافی یا اخراجی لحاظ می‌شود؟",
+"آیین‌نامه داخلی دانشگاه چه شرایطی دارد و چگونه تصویب می‌شود؟"
+
+
+    ]
+    
+    test_questions = [
+"هدف از تهیه دفترچه مشخصات فنی خصوصی طرح سد صفا چیست؟",
+"دفترچه مشخصات فنی خصوصی در صورت تضاد با مشخصات فنی عمومی چه وضعیتی دارد؟",
+"سد صفا در کدام استان و شهرستان واقع شده است؟",
+"طول راه دسترسی به کارگاه سد صفا چقدر است؟",
+"وضعیت فعلی جاده رابر – ساردوئیه چگونه توصیف شده است؟",
+"عرض راه دسترسی مورد پیمان چقدر است؟",
+"میانگین تعداد روزهای یخبندان در محل اجرای پروژه چقدر است؟",
+"شیب عرضی راه و شانه‌ها به ترتیب چقدر است؟",
+"در خاکریزها، شیب شیروانی‌ها به چه نسبت‌هایی طراحی شده‌اند؟",
+"در ترانشه‌های متوالی با جنس‌های مختلف، چه اقدامی باید انجام شود؟",
+"ضخامت روسازی کل راه چند سانتی‌متر است و شامل چه لایه‌هایی است؟",
+"اجزای لایه آسفالت گرم شامل چه نوع آسفالتی و با چه ضخامتی است؟",
+"شیب عرضی در قوس‌ها چگونه تعیین می‌شود؟",
+"وظایف پیمانکار در زمینه پیاده کردن مسیر و برداشت پروفیل چیست؟",
+"چه اقداماتی در صورت اختلاف بین نقشه و برداشت مسیر انجام می‌شود؟",
+"خاک‌های نباتی به چه نحوی باید جمع‌آوری و مدیریت شوند؟",
+"حداکثر ضخامت خاک نباتی برای برداشت بدون صورت‌جلسه چه میزان است؟",
+"بستر خاکریز باید با چه درصد تراکمی آماده شود؟",
+"در صورت تفاوت ارتفاع بستر با روسازی کمتر از ۱۵ سانتی‌متر، چه اقدامی لازم است؟",
+"ضخامت برداشت در کف ترانشه‌ها در صورت نامناسب بودن وضعیت اولیه چقدر است؟",
+"مصالح قرضه و محل دپو باید چگونه انتخاب و تأیید شوند؟",
+"حداکثر ضخامت قشر خاکریزی پس از کوبیدن چقدر است؟",
+"حداقل C.B.R قابل قبول برای خاکریزها چه مقداری است؟",
+"در چه شرایطی خاک استفاده‌شده در خاکریز مردود و باید تعویض شود؟",
+"مصالح اساس چه ویژگی‌هایی از نظر درصد شکست و دانه‌بندی باید داشته باشند؟",
+"ضخامت قشر زیر اساس به چه صورت اجرا می‌شود؟",
+"حداقل ارزش ماسه‌ای مورد قبول برای مصالح اساس چقدر است؟",
+"چه نوع سیمانی در بتن‌های ابنیه فنی پروژه استفاده می‌شود؟",
+"آزمایش‌های کنترل کیفیت سیمان هر چند وقت یک‌بار انجام می‌شود؟",
+"مصالح شانه‌های راه باید چه ویژگی‌هایی داشته باشند؟",
+"در پروژه چه ضوابطی برای اجرای ابنیه فنی و پیکنی در نظر گرفته شده است؟",
+"حداکثر ضخامت سنگریزی پشت پایه پل‌ها چقدر مجاز است؟",
+"در صورت وجود مسیل یا کانال در مسیر، چه اقداماتی پیش از انحراف آن‌ها لازم است؟",
+"پیمانکار در مورد جلوگیری از آسیب به باغات و کشتزارهای محدوده چه مسئولیتی دارد؟",
+"ضخامت لایه‌های شن‌ریزی پشت پایه پل‌ها چقدر باید باشد؟",
+"کدام آزمایش‌ها برای تعیین تراکم و کیفیت مصالح خاکی استفاده می‌شود؟"
+]
+    
+    logger.log("\nLoading document...")
+    try:
+        rag.load_document("merged_new.txt")
+        logger.log("Document loaded successfully!")
+        
+        logger.log("\nTesting questions:")
+        for question in test_questions:
+            logger.log(f"\nQuestion: {question}")
+            response = rag.ask(question)
+            
+            if "error" in response:
+                logger.log(f"Error: {response['error']}")
+            else:
+                logger.log("Answer:")
+                logger.log(response['answer'])
+                if response.get('source_documents'):
+                    logger.log("\nSources:")
+                    for idx, doc in enumerate(response['source_documents'], 1):
+                        if hasattr(doc, 'page_content'):
+                            logger.log(f"Source {idx}: {doc.page_content[:200]}...")
+                logger.log("-" * 80)
+            
+            # Save to file
+            logger.save_qa(question, response)
+            
+    except Exception as e:
+        logger.log(f"Error: {str(e)}")
+
+if __name__ == "__main__":
+    main() 
